@@ -4,10 +4,9 @@ import sys
 import json
 import time
 import bittensor as bt
+from concurrent.futures import ProcessPoolExecutor, TimeoutError
 import pandas as pd
 from pathlib import Path
-from collections import defaultdict
-from typing import Dict
 import nova_ph2
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__)))
@@ -19,9 +18,16 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
 from nova_ph2.PSICHIC.wrapper import PsichicWrapper
 from nova_ph2.PSICHIC.psichic_utils.data_utils import virtual_screening
 
-from molecules import generate_valid_random_molecules_batch
+from molecules import (
+    generate_valid_random_molecules_batch,
+    select_diverse_elites,
+    build_component_weights,
+    compute_tanimoto_similarity_to_pool,
+    sample_random_valid_molecules,
+)
 
 DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
+SIMILARITY_THRESHOLD = 0.9
 
 
 target_models = []
@@ -105,120 +111,47 @@ def antitarget_scores():
         return pd.Series(dtype=float)
 
 
-def build_component_weights(top_pool: pd.DataFrame, rxn_id: int) -> Dict[str, Dict[int, float]]:
+def _cpu_random_candidates_with_similarity(
+    iteration: int,
+    n_samples: int,
+    subnet_config: dict,
+    top_pool_df: pd.DataFrame,
+    avoid_inchikeys: set[str] | None = None,
+) -> pd.DataFrame:
     """
-    Build component weights based on scores of molecules containing them.
-    Returns dict with 'A', 'B', 'C' keys mapping to {component_id: weight}
+    CPU-side helper:
+    - draws a random batch of valid molecules (independent of the GPU batch),
+    - computes Tanimoto similarity vs. current top_pool,
+    - returns a DataFrame with name, smiles, InChIKey, tanimoto_similarity.
     """
-    weights = {'A': defaultdict(float), 'B': defaultdict(float), 'C': defaultdict(float)}
-    counts = {'A': defaultdict(int), 'B': defaultdict(int), 'C': defaultdict(int)}
-    
-    if top_pool.empty:
-        return weights
-    
-    # Extract component IDs and scores
-    for _, row in top_pool.iterrows():
-        name = row['name']
-        score = row['score']
-        parts = name.split(":")
-        if len(parts) >= 4:
-            try:
-                A_id = int(parts[2])
-                B_id = int(parts[3])
-                weights['A'][A_id] += max(0, score)  # Only positive contributions
-                weights['B'][B_id] += max(0, score)
-                counts['A'][A_id] += 1
-                counts['B'][B_id] += 1
-                
-                if len(parts) > 4:
-                    C_id = int(parts[4])
-                    weights['C'][C_id] += max(0, score)
-                    counts['C'][C_id] += 1
-            except (ValueError, IndexError):
-                continue
-    
-    # Normalize by count and add smoothing
-    for role in ['A', 'B', 'C']:
-        for comp_id in weights[role]:
-            if counts[role][comp_id] > 0:
-                weights[role][comp_id] = weights[role][comp_id] / counts[role][comp_id] + 0.1  # Smoothing
-    
-    return weights
+    try:
+        random_df = sample_random_valid_molecules(
+            n_samples=n_samples,
+            subnet_config=subnet_config,
+            avoid_inchikeys=avoid_inchikeys,
+            focus_neighborhood_of=top_pool_df
+        )
+        if random_df.empty or top_pool_df.empty:
+            return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
 
-def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio: float = 0.7) -> pd.DataFrame:
-    """
-    Select diverse elite molecules: top by score, but ensure diversity in component space.
-    """
-    if top_pool.empty or n_elites <= 0:
-        return pd.DataFrame()
-    
-    # Take top candidates (more than needed for diversity filtering)
-    top_candidates = top_pool.head(min(len(top_pool), n_elites * 3))
-    if len(top_candidates) <= n_elites:
-        return top_candidates
-    
-    # Score threshold: at least min_score_ratio of max score
-    max_score = top_candidates['score'].max()
-    threshold = max_score * min_score_ratio
-    candidates = top_candidates[top_candidates['score'] >= threshold]
-    
-    # Select diverse set: prefer molecules with different components
-    selected = []
-    used_components = {'A': set(), 'B': set(), 'C': set()}
-    
-    # First, add top scorer
-    if not candidates.empty:
-        top_idx = candidates.index[0]
-        top_row = candidates.iloc[0]
-        selected.append(top_idx)
-        parts = top_row['name'].split(":")
-        if len(parts) >= 4:
-            try:
-                used_components['A'].add(int(parts[2]))
-                used_components['B'].add(int(parts[3]))
-                if len(parts) > 4:
-                    used_components['C'].add(int(parts[4]))
-            except (ValueError, IndexError):
-                pass
-    
-    # Then add diverse molecules
-    for idx, row in candidates.iterrows():
-        if len(selected) >= n_elites:
-            break
-        if idx in selected:
-            continue
-        
-        parts = row['name'].split(":")
-        if len(parts) >= 4:
-            try:
-                A_id = int(parts[2])
-                B_id = int(parts[3])
-                C_id = int(parts[4]) if len(parts) > 4 else None
-                
-                # Prefer molecules with new components
-                is_diverse = (A_id not in used_components['A'] or 
-                             B_id not in used_components['B'] or
-                             (C_id is not None and C_id not in used_components['C']))
-                
-                if is_diverse or len(selected) < n_elites * 0.5:  # Always take some top ones
-                    selected.append(idx)
-                    used_components['A'].add(A_id)
-                    used_components['B'].add(B_id)
-                    if C_id is not None:
-                        used_components['C'].add(C_id)
-            except (ValueError, IndexError):
-                # If parsing fails, just add it
-                if len(selected) < n_elites:
-                    selected.append(idx)
-    
-    # Fill remaining slots with top scorers
-    for idx, row in candidates.iterrows():
-        if len(selected) >= n_elites:
-            break
-        if idx not in selected:
-            selected.append(idx)
-    
-    return candidates.loc[selected[:n_elites]] if selected else candidates.head(n_elites)
+        sims = compute_tanimoto_similarity_to_pool(
+            candidate_smiles=random_df["smiles"],
+            pool_smiles=top_pool_df["smiles"],
+        )
+        random_df = random_df.copy()
+        random_df["tanimoto_similarity"] = sims.reindex(random_df.index).fillna(0.0)
+        random_df =random_df.sort_values(by="tanimoto_similarity", ascending=False)
+        random_df_filtered = random_df[random_df["tanimoto_similarity"] >= SIMILARITY_THRESHOLD]
+            
+        if random_df_filtered.empty:
+            return pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
+            
+        random_df_filtered = random_df_filtered.reset_index(drop=True)
+        return random_df_filtered[["name", "smiles", "InChIKey"]]
+    except Exception as e:
+        bt.logging.warning(f"[Miner] _cpu_random_candidates_with_similarity failed: {e}")
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
+
 
 def main(config: dict):
     n_samples = config["num_molecules"] * 5
@@ -227,81 +160,126 @@ def main(config: dict):
     iteration = 0
     mutation_prob = 0.1
     elite_frac = 0.25
-    prev_avg_score = None
-    score_improvement_rate = 0.0
     seen_inchikeys = set()
+    seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
     start = time.time()
+    prev_avg_score = None
+    current_avg_score = None
+    score_improvement_rate = 0.0
+    
 
-    n_samples_first_iteration = n_samples if config["allowed_reaction"] == "rxn:5" else n_samples*4
-    while time.time() - start < 1800:
-        iteration += 1
-        start_time = time.time()
-        neighborhood_limit = 2 if (time.time() - start) > 1680 else 0
-        component_weights = build_component_weights(top_pool, rxn_id) if not top_pool.empty else None
-        elite_df = select_diverse_elites(top_pool, min(100, len(top_pool))) if not top_pool.empty else pd.DataFrame()
-        elite_names = elite_df["name"].tolist() if not elite_df.empty else None
-        
-        if prev_avg_score is not None and not top_pool.empty:
-            current_avg = top_pool['score'].mean()
-            score_improvement_rate = (current_avg - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
-            if score_improvement_rate > 0.01:  # Good improvement
-                elite_frac = min(0.7, elite_frac * 1.1)
-                mutation_prob = max(0.05, mutation_prob * 0.95)
-            elif score_improvement_rate < -0.01:  # Declining
-                elite_frac = max(0.2, elite_frac * 0.9)
-                mutation_prob = min(0.4, mutation_prob * 1.1)
+    n_samples_first_iteration = n_samples if config["allowed_reaction"] == "rxn:5" else n_samples * 4
+    with ProcessPoolExecutor(max_workers=1) as cpu_executor:
+        while time.time() - start < 1800:
+            iteration += 1
+            iter_start_time = time.time()
+
+            component_weights = build_component_weights(top_pool, rxn_id) if not top_pool.empty else None
+            elite_df = select_diverse_elites(top_pool, min(100, len(top_pool))) if not top_pool.empty else pd.DataFrame()
+            elite_names = elite_df["name"].tolist() if not elite_df.empty else None
+
+            data = generate_valid_random_molecules_batch(
+                rxn_id,
+                n_samples=n_samples_first_iteration if iteration == 1 else n_samples,
+                db_path=DB_PATH,
+                subnet_config=config,
+                batch_size=300,
+                elite_names=elite_names,
+                elite_frac=elite_frac,
+                mutation_prob=mutation_prob,
+                avoid_inchikeys=seen_inchikeys,
+                component_weights=component_weights,
+            )
+
+            gen_time = time.time() - iter_start_time
+            bt.logging.info(
+                f"[Miner] Iteration {iteration}: {len(data)} Samples Generated in ~{gen_time:.2f}s (pre-score)"
+            )
+
+            if data.empty:
+                bt.logging.warning(f"[Miner] Iteration {iteration}: No valid molecules produced; continuing")
+                continue
             
-        data = generate_valid_random_molecules_batch(rxn_id, n_samples=n_samples_first_iteration if iteration == 1 else n_samples, db_path=DB_PATH, subnet_config=config, batch_size=300, elite_names=elite_names, 
-                                                     elite_frac=elite_frac, mutation_prob=mutation_prob, avoid_inchikeys=seen_inchikeys, component_weights=component_weights, neighborhood_limit=neighborhood_limit)
-                
-        if data.empty:
-            bt.logging.warning(f"[Miner] Iteration {iteration}: No valid molecules produced; continuing")
-            continue
+            if not seed_df.empty:
+                data = pd.concat([data, seed_df])
+                data  = data.drop_duplicates(subset=["InChIKey"], keep="first")
 
-        try:
-            filterd_data = data[~data['InChIKey'].isin(seen_inchikeys)]
-            if len(filterd_data) < len(data):
-                bt.logging.warning(f"[Miner] Iteration {iteration}: {len(data) - len(filterd_data)} molecules were previously seen; continuing with unseen only")
+            try:
+                filterd_data = data[~data["InChIKey"].isin(seen_inchikeys)]
+                if len(filterd_data) < len(data):
+                    bt.logging.warning(
+                        f"[Miner] Iteration {iteration}: {len(data) - len(filterd_data)} molecules were previously seen; continuing with unseen only"
+                    )
 
-            dup_ratio = (len(data) - len(filterd_data)) / max(1, len(data))
-            if dup_ratio > 0.6:
-                mutation_prob = min(0.5, mutation_prob * 1.5)
-                elite_frac = max(0.2, elite_frac * 0.8)
-            elif dup_ratio < 0.2 and not top_pool.empty:
-                mutation_prob = max(0.05, mutation_prob * 0.9)
-                elite_frac = min(0.8, elite_frac * 1.1)
+                dup_ratio = (len(data) - len(filterd_data)) / max(1, len(data))
+                if dup_ratio > 0.6:
+                    mutation_prob = min(0.5, mutation_prob * 1.5)
+                    elite_frac = max(0.2, elite_frac * 0.8)
+                elif dup_ratio < 0.2 and not top_pool.empty:
+                    mutation_prob = max(0.05, mutation_prob * 0.9)
+                    elite_frac = min(0.8, elite_frac * 1.1)
 
-            data = filterd_data
+                data = filterd_data
 
-        except Exception as e:
-            bt.logging.warning(f"[Miner] Pre-score deduplication failed; proceeding unfiltered: {e}")
+            except Exception as e:
+                bt.logging.warning(f"[Miner] Pre-score deduplication failed; proceeding unfiltered: {e}")
 
-        data = data.reset_index(drop=True)
-        data['Target'] = target_score_from_data(data['smiles'])
-        data['Anti'] = antitarget_scores()
-        data['score'] = data['Target'] - (config['antitarget_weight'] * data['Anti'])
-        seen_inchikeys.update([k for k in data["InChIKey"].tolist() if k])
-        total_data = data[["name", "smiles", "InChIKey", "score", "Target", "Anti"]]
-        top_pool = pd.concat([top_pool, total_data])
-        top_pool = top_pool.drop_duplicates(subset=["InChIKey"], keep="first")
-        top_pool = top_pool.sort_values(by="score", ascending=False)
-        top_pool = top_pool.head(config["num_molecules"])
-        
-        current_avg_score = top_pool['score'].mean() if not top_pool.empty else None
+            data = data.reset_index(drop=True)
 
-        if current_avg_score is not None:
-            if prev_avg_score is not None:
-                score_improvement_rate = (current_avg_score - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
-            prev_avg_score = current_avg_score
-        
-        bt.logging.info(f"Iteration {iteration} || Time: {round(time.time() - start_time,2)} | Avg: {top_pool['score'].mean():.4f} | Max: {top_pool['score'].max():.4f} | Min: {top_pool['score'].min():.4f} | Improve: {score_improvement_rate*100:.2f}% | Elite frac: {elite_frac:.3f} | Mute: {mutation_prob:.3f} | Neighbor: {neighborhood_limit}")
-        
-        top_entries = {"molecules": top_pool["name"].tolist()}
-        with open(os.path.join(OUTPUT_DIR, "result.json"), "w") as f:
-            json.dump(top_entries, f, ensure_ascii=False, indent=2)
+            cpu_future = None
+            if not top_pool.empty and (score_improvement_rate<0.005 and iteration>2):
+                cpu_future = cpu_executor.submit(
+                    _cpu_random_candidates_with_similarity,
+                    iteration,
+                    100,
+                    config,
+                    top_pool.head(5)[["name", "smiles", "InChIKey"]],
+                    seen_inchikeys,
+                )
+
+            gpu_start_time = time.time()
+            data["Target"] = target_score_from_data(data["smiles"])
+            data["Anti"] = antitarget_scores()
+            data["score"] = data["Target"] - (config["antitarget_weight"] * data["Anti"])
+            
+            gpu_time = time.time() - gpu_start_time
+            bt.logging.info(f"[Miner] Iteration {iteration}: GPU scoring time ~{gpu_time:.2f}s")
+            if cpu_future is not None:
+                try:
+                    cpu_df = cpu_future.result(timeout=0)
+                    if not cpu_df.empty:
+                        seed_df = cpu_df.copy()
+                except TimeoutError:
+                    bt.logging.info(f"[Miner] Iteration {iteration}: CPU similarity still running — continuing without it this iteration")
+                except Exception as e:
+                    bt.logging.warning(f"[Miner] CPU random/similarity computation failed; proceeding without it: {e}")
+            seen_inchikeys.update([k for k in data["InChIKey"].tolist() if k])
+            total_data = data[["name", "smiles", "InChIKey", "score", "Target", "Anti"]]
+            prev_avg_score = top_pool['score'].mean() if not top_pool.empty else None
+            top_pool = pd.concat([top_pool, total_data])
+            top_pool = top_pool.drop_duplicates(subset=["InChIKey"], keep="first")
+            top_pool = top_pool.sort_values(by="score", ascending=False)
+            top_pool = top_pool.head(config["num_molecules"])
+            current_avg_score = top_pool['score'].mean() if not top_pool.empty else None
+
+            if current_avg_score is not None:
+                if prev_avg_score is not None:
+                    score_improvement_rate = (current_avg_score - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
+                prev_avg_score = current_avg_score
+            iter_total_time = time.time() - iter_start_time
+            top_entries = {"molecules": top_pool["name"].tolist()}
+            bt.logging.info(
+                    f"Iteration {iteration} || Time: {iter_total_time:.2f}s | "
+                    f"Avg: {top_pool['score'].mean():.4f} | Max: {top_pool['score'].max():.4f} | "
+                    f"Min: {top_pool['score'].min():.4f} | Elite frac: {elite_frac:.2f} | "
+                    f"Mute: {mutation_prob:.2f} | "
+                    f"Improve: {score_improvement_rate:.4f}"
+                )
+
+            with open(os.path.join(OUTPUT_DIR, "result.json"), "w") as f:
+                json.dump(top_entries, f, ensure_ascii=False, indent=2)
 
 if __name__ == "__main__":
-    
     config = get_config()
     start_time_1 = time.time()
     initialize_models(config)
