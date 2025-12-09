@@ -8,6 +8,7 @@ from concurrent.futures import ProcessPoolExecutor, TimeoutError
 import pandas as pd
 from pathlib import Path
 import nova_ph2
+from itertools import combinations
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -17,17 +18,16 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
 
 from nova_ph2.PSICHIC.wrapper import PsichicWrapper
 from nova_ph2.PSICHIC.psichic_utils.data_utils import virtual_screening
-
 from molecules import (
     generate_valid_random_molecules_batch,
     select_diverse_elites,
     build_component_weights,
     compute_tanimoto_similarity_to_pool,
     sample_random_valid_molecules,
+    compute_maccs_entropy
 )
 
 DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
-SIMILARITY_THRESHOLD = 0.9
 
 
 target_models = []
@@ -117,6 +117,7 @@ def _cpu_random_candidates_with_similarity(
     subnet_config: dict,
     top_pool_df: pd.DataFrame,
     avoid_inchikeys: set[str] | None = None,
+    thresh: float = 0.8
 ) -> pd.DataFrame:
     """
     CPU-side helper:
@@ -141,7 +142,7 @@ def _cpu_random_candidates_with_similarity(
         random_df = random_df.copy()
         random_df["tanimoto_similarity"] = sims.reindex(random_df.index).fillna(0.0)
         random_df =random_df.sort_values(by="tanimoto_similarity", ascending=False)
-        random_df_filtered = random_df[random_df["tanimoto_similarity"] >= SIMILARITY_THRESHOLD]
+        random_df_filtered = random_df[random_df["tanimoto_similarity"] >= thresh]
             
         if random_df_filtered.empty:
             return pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
@@ -151,6 +152,18 @@ def _cpu_random_candidates_with_similarity(
     except Exception as e:
         bt.logging.warning(f"[Miner] _cpu_random_candidates_with_similarity failed: {e}")
         return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
+
+def select_diverse_subset(pool, top_95_smiles, subset_size=5, entropy_threshold=0.1):
+    smiles_list = pool["smiles"].tolist()
+    for combination in combinations(smiles_list, subset_size):
+        test_subset = top_95_smiles + list(combination)
+        entropy = compute_maccs_entropy(test_subset)
+        if entropy >= entropy_threshold:
+            print(f"Entropy Threshold Met: {entropy:.4f}")
+            return pool[pool["smiles"].isin(combination)]
+
+    print("No combination exceeded the given entropy threshold.")
+    return pd.DataFrame()
 
 
 def main(config: dict):
@@ -173,6 +186,11 @@ def main(config: dict):
         while time.time() - start < 1800:
             iteration += 1
             iter_start_time = time.time()
+            remaining_time = 1800 - (time.time() - start)
+
+            adjust_for_entropy = False
+            if remaining_time <= 60:
+                adjust_for_entropy = True
 
             component_weights = build_component_weights(top_pool, rxn_id) if not top_pool.empty else None
             elite_df = select_diverse_elites(top_pool, min(100, len(top_pool))) if not top_pool.empty else pd.DataFrame()
@@ -227,16 +245,26 @@ def main(config: dict):
             data = data.reset_index(drop=True)
 
             cpu_future = None
-            if not top_pool.empty and (score_improvement_rate<0.01 and iteration>1):
+            if not top_pool.empty and (score_improvement_rate<0.02 and iteration>1):
                 cpu_future = cpu_executor.submit(
                     _cpu_random_candidates_with_similarity,
                     iteration,
-                    100,
+                    60,
                     config,
                     top_pool.head(5)[["name", "smiles", "InChIKey"]],
                     seen_inchikeys,
+                    0.9
                 )
-
+            elif not top_pool.empty and score_improvement_rate==0:
+                cpu_future = cpu_executor.submit(
+                    _cpu_random_candidates_with_similarity,
+                    iteration,
+                    30,
+                    config,
+                    top_pool.head(10)[["name", "smiles", "InChIKey"]],
+                    seen_inchikeys,
+                    0.7
+                )
             gpu_start_time = time.time()
             data["Target"] = target_score_from_data(data["smiles"])
             data["Anti"] = antitarget_scores()
@@ -259,7 +287,26 @@ def main(config: dict):
             top_pool = pd.concat([top_pool, total_data])
             top_pool = top_pool.drop_duplicates(subset=["InChIKey"], keep="first")
             top_pool = top_pool.sort_values(by="score", ascending=False)
-            top_pool = top_pool.head(config["num_molecules"])
+
+            if adjust_for_entropy:
+                try:
+                    top_95 = top_pool.iloc[:95]
+                    remaining_pool = top_pool.iloc[95:]  # Remaining molecules after the top 95
+                    additional_5 = select_diverse_subset(remaining_pool, top_95["smiles"].tolist(), subset_size=5, entropy_threshold=config['entropy_min_threshold'])
+                    if not additional_5.empty:
+                        top_pool = pd.concat([top_95, additional_5]).reset_index(drop=True)
+                        entropy = compute_maccs_entropy(top_pool['smiles'].to_list())
+                        bt.logging.info(f"[Miner] Iteration {iteration}: New Entropy = {entropy:.4f}")
+                    else:
+                        top_pool = top_pool.head(config["num_molecules"])
+                        entropy = compute_maccs_entropy(top_pool['smiles'].to_list())
+                        bt.logging.info(f"[Miner] Iteration {iteration}: New Entropy = {entropy:.4f}")
+                
+                except Exception as e:
+                    bt.logging.warning(f"[Miner] Entropy handling failed: {e}")
+            else:
+                top_pool = top_pool.head(config["num_molecules"])
+            
             current_avg_score = top_pool['score'].mean() if not top_pool.empty else None
 
             if current_avg_score is not None:
