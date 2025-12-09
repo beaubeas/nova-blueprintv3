@@ -15,7 +15,8 @@ from nova_ph2.combinatorial_db.reactions import get_smiles_from_reaction, get_re
 from nova_ph2.utils.molecules import get_heavy_atom_count
 from collections import defaultdict
 from itertools import chain
-
+import numpy as np
+import math
 
 @lru_cache(maxsize=1000_000)
 def _get_smiles_from_reaction_cached(name: str):
@@ -59,6 +60,30 @@ def _inchikey_from_name_cached(name: str) -> str:
         return generate_inchikey(s)
     except Exception:
         return ""
+
+def compute_maccs_entropy(smiles_list: list[str]) -> float:
+    n_bits = 167  # RDKit uses 167 bits (index 0 is always 0)
+    bit_counts = np.zeros(n_bits)
+    valid_mols = 0
+
+    for smi in smiles_list:
+        fp = _maccs_fp_from_smiles_cached(smi)
+        arr = np.array(fp)
+        bit_counts += arr
+        valid_mols += 1
+
+    if valid_mols == 0:
+        raise ValueError("No valid molecules found.")
+
+    probs = bit_counts / valid_mols
+    entropy_per_bit = np.array([
+        -p * math.log2(p) - (1 - p) * math.log2(1 - p) if 0 < p < 1 else 0
+        for p in probs
+    ])
+
+    avg_entropy = np.mean(entropy_per_bit)
+
+    return avg_entropy
 
 def num_rotatable_bonds(smiles: str) -> int:
     """Get number of rotatable bonds from SMILES string."""
