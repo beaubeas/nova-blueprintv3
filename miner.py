@@ -245,25 +245,15 @@ def main(config: dict):
             data = data.reset_index(drop=True)
 
             cpu_future = None
-            if not top_pool.empty and (score_improvement_rate<0.02 and iteration>1):
+            if not top_pool.empty and (score_improvement_rate<0.01 and iteration>1):
                 cpu_future = cpu_executor.submit(
                     _cpu_random_candidates_with_similarity,
                     iteration,
-                    60,
+                    100,
                     config,
                     top_pool.head(5)[["name", "smiles", "InChIKey"]],
                     seen_inchikeys,
                     0.9
-                )
-            elif not top_pool.empty and score_improvement_rate==0:
-                cpu_future = cpu_executor.submit(
-                    _cpu_random_candidates_with_similarity,
-                    iteration,
-                    30,
-                    config,
-                    top_pool.head(10)[["name", "smiles", "InChIKey"]],
-                    seen_inchikeys,
-                    0.7
                 )
             gpu_start_time = time.time()
             data["Target"] = target_score_from_data(data["smiles"])
@@ -281,7 +271,7 @@ def main(config: dict):
                     bt.logging.info(f"[Miner] Iteration {iteration}: CPU similarity still running — continuing without it this iteration")
                 except Exception as e:
                     bt.logging.warning(f"[Miner] CPU random/similarity computation failed; proceeding without it: {e}")
-            seen_inchikeys.update([k for k in data.iloc[:500]["InChIKey"].tolist() if k])
+            seen_inchikeys.update([k for k in data["InChIKey"].tolist() if k])
             total_data = data[["name", "smiles", "InChIKey", "score", "Target", "Anti"]]
             prev_avg_score = top_pool['score'].mean() if not top_pool.empty else None
             top_pool = pd.concat([top_pool, total_data])
