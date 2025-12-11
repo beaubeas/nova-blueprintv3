@@ -245,11 +245,11 @@ def main(config: dict):
             data = data.reset_index(drop=True)
 
             cpu_future = None
-            if not top_pool.empty and (score_improvement_rate<0.01 and iteration>1):
+            if not top_pool.empty and (score_improvement_rate<0.02 and iteration>1):
                 cpu_future = cpu_executor.submit(
                     _cpu_random_candidates_with_similarity,
                     iteration,
-                    100,
+                    60,
                     config,
                     top_pool.head(5)[["name", "smiles", "InChIKey"]],
                     seen_inchikeys,
